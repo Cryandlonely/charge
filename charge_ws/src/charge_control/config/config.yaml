@@ -1,0 +1,35 @@
+# 充电控制配置文件
+
+# 串口配置
+serial:
+  port: "/dev/ttyS1"
+  baud_rate: 19200
+  max_current: 10.0
+
+# GPIO 配置
+gpio:
+  gpio_num_enable: 380
+  monitor_interval_ms: 100
+  # 额外的GPIO引脚列表
+  # 397：对应电池电量 25%-50%
+  # 387：对应电池电量 50%-75%
+  # 395：对应电池电量 75%-100%
+  # 394：对应电池剩余电量 100%
+  # 379：快速充电模式
+  # 388：智能充电模式
+  # 387：充电桩故障
+  # 389：充电中状态
+  # 420：充电桩进入待机状态
+
+  # 382， 402：继电器控制
+  gpio_pins: [382, 402, 397, 387, 395, 394, 379, 388, 387, 389, 420]
+
+# MQTT 配置
+mqtt:
+  broker: "tcp://localhost:1883"
+  client_id: "charge_control"
+  topic: "charge/dog_connect"
+
+# HTTP 服务器配置
+http:
+  port: 8080
