@@ -99,15 +99,10 @@ void initLogger() {
     std::string date_str = getCurrentDateString();
     std::string log_file = log_dir + "/charge_control_" + date_str + ".log";
 
-    // 创建 layout
     log4cpp::PatternLayout* fileLayout = new log4cpp::PatternLayout();
     fileLayout->setConversionPattern("%d{%Y-%m-%d %H:%M:%S.%l} [%p] %m%n");
-
-    // 使用 FileAppender (追加模式，第三个参数true表示追加)
     log4cpp::FileAppender* fileAppender = new log4cpp::FileAppender("fileAppender", log_file, true);
     fileAppender->setLayout(fileLayout);
-
-    // 配置 root category
     logger.setPriority(log4cpp::Priority::DEBUG);
     logger.addAppender(fileAppender);
 
