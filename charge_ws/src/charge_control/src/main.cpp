@@ -22,6 +22,7 @@
 #include "gpio_control.hpp"
 #include "http_server.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "ament_index_cpp/get_package_share_directory.hpp"
 #include "serial_port.hpp"
 #include "std_msgs/msg/float32_multi_array.hpp"
 #include "udp_protocol.hpp"
@@ -86,7 +87,7 @@ void cleanOldLogs(const std::string& log_dir, int keep_days) {
 // 初始化日志系统
 void initLogger() {
   try {
-    std::string log_dir = "/home/sunrise/charge_ws/logs";
+    std::string log_dir = "./logs";
     int keep_days = 30;  // 保留30天的日志
 
     // 确保日志目录存在
@@ -119,11 +120,11 @@ namespace charge_control {
 // MQTT 回调类
 class MqttCallback : public virtual mqtt::callback {
  public:
-  MqttCallback(std::function<void(const std::string&)> on_message_cb) : on_message_cb_(on_message_cb) {}
+  MqttCallback(std::function<void(const std::string&, const std::string&)> on_message_cb) : on_message_cb_(on_message_cb) {}
 
   void message_arrived(mqtt::const_message_ptr msg) override {
     if (on_message_cb_) {
-      on_message_cb_(msg->to_string());
+      on_message_cb_(msg->get_topic(), msg->to_string());
     }
   }
 
@@ -136,7 +137,7 @@ class MqttCallback : public virtual mqtt::callback {
   }
 
  private:
-  std::function<void(const std::string&)> on_message_cb_;
+  std::function<void(const std::string&, const std::string&)> on_message_cb_;
 };
 
 class SerialSenderNode : public rclcpp::Node {
@@ -164,6 +165,9 @@ class SerialSenderNode : public rclcpp::Node {
   std::shared_ptr<mqtt::async_client> mqtt_client_;
   std::shared_ptr<MqttCallback> mqtt_callback_;
   std::atomic<bool> mqtt_running_{false};
+  std::thread mqtt_consume_thread_;  // MQTT消息消费线程
+  std::string current_dog_id_;  // 当前连接的狗ID
+  std::mutex dog_id_mutex_;     // 保护狗ID的互斥锁
 
   // HTTP
   int http_port_{8080};
@@ -204,7 +208,7 @@ class SerialSenderNode : public rclcpp::Node {
     monitor_timer_ = this->create_wall_timer(std::chrono::milliseconds(monitor_interval_ms_), std::bind(&SerialSenderNode::MonitorGpioCallback, this));
 
     // Start MQTT Client
-    // StartMqttClient();
+    StartMqttClient();
 
     // Start HTTP Server
     StartHttpServer();
@@ -213,7 +217,7 @@ class SerialSenderNode : public rclcpp::Node {
   }
 
   ~SerialSenderNode() {
-    // StopMqttClient();
+    StopMqttClient();
     StopHttpServer();
     StopUdpServer();
   }
@@ -221,7 +225,16 @@ class SerialSenderNode : public rclcpp::Node {
  private:
   // 从yaml配置文件加载参数
   void LoadConfig() {
-    std::string config_path = "/home/sunrise/charge_ws/src/charge_control/config/config.yaml";
+    std::string config_path;
+    try {
+      // 使用ament_index获取包的share目录
+      std::string package_share_dir = ament_index_cpp::get_package_share_directory("charge_control");
+      config_path = package_share_dir + "/config.yaml";
+    } catch (const std::exception& e) {
+      // 如果获取失败，尝试使用相对路径（开发时）
+      config_path = "./config/config.yaml";
+      RCLCPP_WARN(this->get_logger(), "Using fallback config path: %s", config_path.c_str());
+    }
     try {
       YAML::Node config = YAML::LoadFile(config_path);
 
@@ -267,10 +280,6 @@ class SerialSenderNode : public rclcpp::Node {
     try {
       mqtt_client_ = std::make_shared<mqtt::async_client>(mqtt_broker_, mqtt_client_id_);
 
-      // 设置回调
-      mqtt_callback_ = std::make_shared<MqttCallback>([this](const std::string& msg) { this->OnMqttMessage(msg); });
-      mqtt_client_->set_callback(*mqtt_callback_);
-
       // 连接选项
       mqtt::connect_options conn_opts;
       conn_opts.set_clean_session(true);
@@ -282,8 +291,27 @@ class SerialSenderNode : public rclcpp::Node {
       // 异步连接
       mqtt_client_->connect(conn_opts)->wait();
 
+      // 启动消息消费
+      mqtt_client_->start_consuming();
+
       // 订阅主题
       mqtt_client_->subscribe(mqtt_topic_, 1)->wait();
+
+      // 启动消费线程来处理消息
+      mqtt_consume_thread_ = std::thread([this]() {
+        while (mqtt_running_) {
+          try {
+            auto msg = mqtt_client_->try_consume_message_for(std::chrono::milliseconds(100));
+            if (msg) {
+              OnMqttMessage(msg->get_topic(), msg->to_string());
+            }
+          } catch (const std::exception& e) {
+            if (mqtt_running_) {
+              RCLCPP_WARN(this->get_logger(), "MQTT consume error: %s", e.what());
+            }
+          }
+        }
+      });
 
       RCLCPP_INFO(this->get_logger(), "MQTT Client connected to %s, subscribed to %s", mqtt_broker_.c_str(), mqtt_topic_.c_str());
     } catch (const mqtt::exception& e) {
@@ -294,7 +322,14 @@ class SerialSenderNode : public rclcpp::Node {
   void StopMqttClient() {
     if (mqtt_running_ && mqtt_client_) {
       mqtt_running_ = false;
+      
+      // 等待消费线程结束
+      if (mqtt_consume_thread_.joinable()) {
+        mqtt_consume_thread_.join();
+      }
+      
       try {
+        mqtt_client_->stop_consuming();
         mqtt_client_->disconnect()->wait();
         RCLCPP_INFO(this->get_logger(), "MQTT Client stopped");
       } catch (const mqtt::exception& e) {
@@ -303,16 +338,37 @@ class SerialSenderNode : public rclcpp::Node {
     }
   }
 
-  void OnMqttMessage(const std::string& message) {
-    RCLCPP_INFO(this->get_logger(), "MQTT message received: %s", message.c_str());
+  void OnMqttMessage(const std::string& topic, const std::string& message) {
+    RCLCPP_INFO(this->get_logger(), "MQTT message received on topic [%s]: %s", topic.c_str(), message.c_str());
 
-    // 处理连接
-    OnDogConnected(message);
+    // 从话题中提取狗ID，格式: charge/{dog_id}/dog_status
+    std::string dog_id = ExtractDogIdFromTopic(topic);
+    if (dog_id.empty()) {
+      RCLCPP_WARN(this->get_logger(), "Failed to extract dog_id from topic: %s", topic.c_str());
+      return;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Dog ID: %s", dog_id.c_str());
+
+    // 解析JSON消息
+    try {
+      nlohmann::json j = nlohmann::json::parse(message);
+      DogStatus status = j.get<DogStatus>();
+      
+      // 打印狗状态数据
+      PrintDogStatus(dog_id, status);
+      
+      // 保存当前狗ID并处理状态
+      OnDogStatusReceived(dog_id, status);
+
+    } catch (const nlohmann::json::exception& e) {
+      RCLCPP_ERROR(this->get_logger(), "Failed to parse JSON message: %s", e.what());
+    }
 
     // 发布确认消息（可选）
     if (mqtt_client_ && mqtt_client_->is_connected()) {
       try {
-        std::string reply_topic = mqtt_topic_ + "/ack";
+        std::string reply_topic = "charge/" + dog_id + "/dog_status/ack";
         mqtt_client_->publish(reply_topic, "ACK", 3, 1, false);
       } catch (const mqtt::exception& e) {
         RCLCPP_WARN(this->get_logger(), "Failed to publish ACK: %s", e.what());
@@ -320,7 +376,46 @@ class SerialSenderNode : public rclcpp::Node {
     }
   }
 
-  void OnDogConnected(const std::string& dog_id) { RCLCPP_INFO(this->get_logger(), "Dog with ID %s connected!", dog_id.c_str()); }
+  // 从话题中提取狗ID
+  std::string ExtractDogIdFromTopic(const std::string& topic) {
+    // 话题格式: charge/{dog_id}/dog_status
+    std::regex topic_pattern(R"(charge/([^/]+)/dog_status)");
+    std::smatch match;
+    if (std::regex_match(topic, match, topic_pattern) && match.size() > 1) {
+      return match[1].str();
+    }
+    return "";
+  }
+
+  // 打印狗状态数据
+  void PrintDogStatus(const std::string& dog_id, const DogStatus& status) {
+    RCLCPP_INFO(this->get_logger(), "========== Dog Status [%s] ==========", dog_id.c_str());
+    RCLCPP_INFO(this->get_logger(), "  ID: %s", status.ID.c_str());
+    RCLCPP_INFO(this->get_logger(), "  Fault Code: %d, Fault Level: %d", 
+                status.fault_code, status.fault_level);
+    RCLCPP_INFO(this->get_logger(), "  Fault Message: %s", status.fault_message.c_str());
+    RCLCPP_INFO(this->get_logger(), "  Charging Status: %d", static_cast<int>(status.charging_status));
+    RCLCPP_INFO(this->get_logger(), "  Battery 1: Power=%.1f%%, Voltage=%.2fV, Current=%.2fA, Temp=%.1f C, Present=%s, Status=%d",
+                status.power1, status.voltage1, status.current1, status.temperature1, 
+                status.present1 ? "Yes" : "No", static_cast<int>(status.power_supply_status1));
+    RCLCPP_INFO(this->get_logger(), "  Battery 2: Power=%.1f%%, Voltage=%.2fV, Current=%.2fA, Temp=%.1f C, Present=%s, Status=%d",
+                status.power2, status.voltage2, status.current2, status.temperature2,
+                status.present2 ? "Yes" : "No", static_cast<int>(status.power_supply_status2));
+    RCLCPP_INFO(this->get_logger(), "========================================");
+  }
+
+  void OnDogStatusReceived(const std::string& dog_id, const DogStatus& status) {
+    RCLCPP_INFO(this->get_logger(), "Dog [%s] status received, charging_status=%d", 
+                dog_id.c_str(), static_cast<int>(status.charging_status));
+    
+    // 保存当前连接的狗ID
+    {
+      std::lock_guard<std::mutex> lock(dog_id_mutex_);
+      current_dog_id_ = dog_id;
+    }
+    
+    // TODO: 根据狗的状态进行相应处理
+  }
 
   void StartHttpServer() {
     http_server_ = std::make_shared<HttpServer>();
@@ -522,12 +617,54 @@ class SerialSenderNode : public rclcpp::Node {
     if (new_value == 1) {
       // 上升沿：从低电平变为高电平
       RCLCPP_INFO(this->get_logger(), "Enable signal RISING edge detected");
-      // TODO: 在这里添加上升沿触发的操作
+      
+      // 发送充电命令给当前连接的狗
+      SendChargeCommand(false, true);  // charge_stop=false, recharge=true
 
     } else {
       // 下降沿：从高电平变为低电平
       RCLCPP_INFO(this->get_logger(), "Enable signal FALLING edge detected");
       // TODO: 在这里添加下降沿触发的操作
+    }
+  }
+
+  // 发送充电命令到 charge/{dog_id}/command 话题
+  void SendChargeCommand(bool charge_stop, bool recharge) {
+    std::string dog_id;
+    {
+      std::lock_guard<std::mutex> lock(dog_id_mutex_);
+      dog_id = current_dog_id_;
+    }
+
+    if (dog_id.empty()) {
+      RCLCPP_WARN(this->get_logger(), "No dog connected, cannot send charge command");
+      return;
+    }
+
+    if (!mqtt_client_ || !mqtt_client_->is_connected()) {
+      RCLCPP_WARN(this->get_logger(), "MQTT client not connected, cannot send charge command");
+      return;
+    }
+
+    try {
+      // 构建命令消息
+      ChargeCommand cmd;
+      cmd.charge_stop = charge_stop;
+      cmd.recharge = recharge;
+
+      nlohmann::json j = cmd;
+      std::string payload = j.dump();
+
+      // 发送到 charge/{dog_id}/command 话题
+      std::string command_topic = "charge/" + dog_id + "/command";
+      mqtt_client_->publish(command_topic, payload, 1, false)->wait();
+
+      RCLCPP_INFO(this->get_logger(), "Sent charge command to [%s]: %s", 
+                  command_topic.c_str(), payload.c_str());
+    } catch (const mqtt::exception& e) {
+      RCLCPP_ERROR(this->get_logger(), "Failed to send charge command: %s", e.what());
+    } catch (const nlohmann::json::exception& e) {
+      RCLCPP_ERROR(this->get_logger(), "Failed to serialize charge command: %s", e.what());
     }
   }
 

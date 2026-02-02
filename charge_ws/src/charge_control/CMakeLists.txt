@@ -9,11 +9,13 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(PkgConfig REQUIRED)
 
 # Find Paho MQTT C++ library
 find_package(PahoMqttCpp REQUIRED)
 find_package(yaml-cpp REQUIRED)
+find_package(nlohmann_json 3.10.5 REQUIRED)
 pkg_check_modules(LOG4CPP REQUIRED log4cpp)
 
 # Include directories
@@ -46,8 +48,8 @@ target_include_directories(udp_protocol PUBLIC
 
 # Main executable
 add_executable(charge src/main.cpp)
-target_link_libraries(charge serial_port gpio_control http_server udp_protocol PahoMqttCpp::paho-mqttpp3 yaml-cpp ${LOG4CPP_LIBRARIES})
-ament_target_dependencies(charge rclcpp std_msgs)
+target_link_libraries(charge serial_port gpio_control http_server udp_protocol PahoMqttCpp::paho-mqttpp3 yaml-cpp nlohmann_json::nlohmann_json ${LOG4CPP_LIBRARIES})
+ament_target_dependencies(charge rclcpp std_msgs ament_index_cpp)
 
 # Install targets
 install(TARGETS serial_port gpio_control http_server udp_protocol

@@ -12,6 +12,7 @@
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>ament_index_cpp</depend>
   <depend>libpaho-mqtt-dev</depend>
   <depend>libpaho-mqttpp-dev</depend>
 
