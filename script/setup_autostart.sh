@@ -18,7 +18,7 @@ echo "=========================================="
 
 # 获取实际用户名（非 root）
 REAL_USER=${SUDO_USER:-sunrise}
-WORKSPACE="/home/${REAL_USER}/charge_ws"
+WORKSPACE="/home/${REAL_USER}/charge/charge_ws"
 
 echo "[1/3] 用户: $REAL_USER"
 echo "      工作空间: $WORKSPACE"

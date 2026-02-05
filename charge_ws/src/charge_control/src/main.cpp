@@ -18,11 +18,11 @@
 #include <thread>
 #include <vector>
 
+#include "ament_index_cpp/get_package_share_directory.hpp"
 #include "common.hpp"
 #include "gpio_control.hpp"
 #include "http_server.hpp"
 #include "rclcpp/rclcpp.hpp"
-#include "ament_index_cpp/get_package_share_directory.hpp"
 #include "serial_port.hpp"
 #include "std_msgs/msg/float32_multi_array.hpp"
 #include "udp_protocol.hpp"
@@ -166,8 +166,8 @@ class SerialSenderNode : public rclcpp::Node {
   std::shared_ptr<MqttCallback> mqtt_callback_;
   std::atomic<bool> mqtt_running_{false};
   std::thread mqtt_consume_thread_;  // MQTT消息消费线程
-  std::string current_dog_id_;  // 当前连接的狗ID
-  std::mutex dog_id_mutex_;     // 保护狗ID的互斥锁
+  std::string current_dog_id_;       // 当前连接的狗ID
+  std::mutex dog_id_mutex_;          // 保护狗ID的互斥锁
 
   // HTTP
   int http_port_{8080};
@@ -177,7 +177,7 @@ class SerialSenderNode : public rclcpp::Node {
   int udp_port_{53100};
   std::shared_ptr<UdpProtocolHandler> udp_handler_;
 
-  //默认AP设置
+  // 默认AP设置
   std::string default_ap_ssid_{"AP"};
   std::string default_ap_password_{""};
 
@@ -203,6 +203,9 @@ class SerialSenderNode : public rclcpp::Node {
     // 继电器高电平
     SetGpioHigh(382);
     SetGpioHigh(402);
+
+    // 设置充电桩待机状态
+    SetGpioHigh(420);
 
     // 创建定时器监控 GPIO 381 电平变化
     monitor_timer_ = this->create_wall_timer(std::chrono::milliseconds(monitor_interval_ms_), std::bind(&SerialSenderNode::MonitorGpioCallback, this));
@@ -322,12 +325,12 @@ class SerialSenderNode : public rclcpp::Node {
   void StopMqttClient() {
     if (mqtt_running_ && mqtt_client_) {
       mqtt_running_ = false;
-      
+
       // 等待消费线程结束
       if (mqtt_consume_thread_.joinable()) {
         mqtt_consume_thread_.join();
       }
-      
+
       try {
         mqtt_client_->stop_consuming();
         mqtt_client_->disconnect()->wait();
@@ -354,25 +357,15 @@ class SerialSenderNode : public rclcpp::Node {
     try {
       nlohmann::json j = nlohmann::json::parse(message);
       DogStatus status = j.get<DogStatus>();
-      
+
       // 打印狗状态数据
-      PrintDogStatus(dog_id, status);
-      
+      // PrintDogStatus(dog_id, status);
+
       // 保存当前狗ID并处理状态
       OnDogStatusReceived(dog_id, status);
 
     } catch (const nlohmann::json::exception& e) {
       RCLCPP_ERROR(this->get_logger(), "Failed to parse JSON message: %s", e.what());
-    }
-
-    // 发布确认消息（可选）
-    if (mqtt_client_ && mqtt_client_->is_connected()) {
-      try {
-        std::string reply_topic = "charge/" + dog_id + "/dog_status/ack";
-        mqtt_client_->publish(reply_topic, "ACK", 3, 1, false);
-      } catch (const mqtt::exception& e) {
-        RCLCPP_WARN(this->get_logger(), "Failed to publish ACK: %s", e.what());
-      }
     }
   }
 
@@ -391,30 +384,50 @@ class SerialSenderNode : public rclcpp::Node {
   void PrintDogStatus(const std::string& dog_id, const DogStatus& status) {
     RCLCPP_INFO(this->get_logger(), "========== Dog Status [%s] ==========", dog_id.c_str());
     RCLCPP_INFO(this->get_logger(), "  ID: %s", status.ID.c_str());
-    RCLCPP_INFO(this->get_logger(), "  Fault Code: %d, Fault Level: %d", 
-                status.fault_code, status.fault_level);
+    RCLCPP_INFO(this->get_logger(), "  Fault Code: %d, Fault Level: %d", status.fault_code, status.fault_level);
     RCLCPP_INFO(this->get_logger(), "  Fault Message: %s", status.fault_message.c_str());
     RCLCPP_INFO(this->get_logger(), "  Charging Status: %d", static_cast<int>(status.charging_status));
-    RCLCPP_INFO(this->get_logger(), "  Battery 1: Power=%.1f%%, Voltage=%.2fV, Current=%.2fA, Temp=%.1f C, Present=%s, Status=%d",
-                status.power1, status.voltage1, status.current1, status.temperature1, 
-                status.present1 ? "Yes" : "No", static_cast<int>(status.power_supply_status1));
-    RCLCPP_INFO(this->get_logger(), "  Battery 2: Power=%.1f%%, Voltage=%.2fV, Current=%.2fA, Temp=%.1f C, Present=%s, Status=%d",
-                status.power2, status.voltage2, status.current2, status.temperature2,
-                status.present2 ? "Yes" : "No", static_cast<int>(status.power_supply_status2));
+    RCLCPP_INFO(this->get_logger(), "  Battery 1: Power=%.1f%%, Voltage=%.2fV, Current=%.2fA, Temp=%.1f C, Present=%s, Status=%d", status.power1, status.voltage1,
+                status.current1, status.temperature1, status.present1 ? "Yes" : "No", static_cast<int>(status.power_supply_status1));
+    RCLCPP_INFO(this->get_logger(), "  Battery 2: Power=%.1f%%, Voltage=%.2fV, Current=%.2fA, Temp=%.1f C, Present=%s, Status=%d", status.power2, status.voltage2,
+                status.current2, status.temperature2, status.present2 ? "Yes" : "No", static_cast<int>(status.power_supply_status2));
     RCLCPP_INFO(this->get_logger(), "========================================");
   }
 
   void OnDogStatusReceived(const std::string& dog_id, const DogStatus& status) {
-    RCLCPP_INFO(this->get_logger(), "Dog [%s] status received, charging_status=%d", 
-                dog_id.c_str(), static_cast<int>(status.charging_status));
-    
+    double power = (status.power1 + status.power2) / 2.0;
+
     // 保存当前连接的狗ID
     {
       std::lock_guard<std::mutex> lock(dog_id_mutex_);
       current_dog_id_ = dog_id;
     }
-    
-    // TODO: 根据狗的状态进行相应处理
+
+    if (status.charging_status == ChargingStatus::CHARGING) {
+      SetGpioHigh(389);
+      // 设置电量指示灯
+      if (power < 25.0) {
+        SetGpioLow(397);
+        SetGpioLow(387);
+        SetGpioLow(395);
+        SetGpioLow(394);
+      } else if (power < 50.0 && power >= 25.0) {
+        SetGpioHigh(397);
+        SetGpioLow(387);
+        SetGpioLow(395);
+        SetGpioLow(394);
+      } else if (power < 75.0 && power >= 50.0) {
+        SetGpioHigh(397);
+        SetGpioHigh(387);
+        SetGpioLow(395);
+        SetGpioLow(394);
+      } else if (power < 100.0 && power >= 75.0) {
+        SetGpioHigh(397);
+        SetGpioHigh(387);
+        SetGpioHigh(395);
+        SetGpioHigh(394);
+      }
+    }
   }
 
   void StartHttpServer() {
@@ -422,6 +435,9 @@ class SerialSenderNode : public rclcpp::Node {
 
     // 注册WiFi连接接口
     http_server_->RegisterHandler("POST", "/wifi/connect", [this](const HttpRequest& req) { return HandleWifiConnect(req, default_ap_ssid_, default_ap_password_); });
+
+    // 注册充电模式切换接口
+    http_server_->RegisterHandler("POST", "/charge/switch", [this](const HttpRequest& req) { return HandleChargeModeSwitch(req); });
 
     if (http_server_->Start(http_port_)) {
       RCLCPP_INFO(this->get_logger(), "HTTP Server started on port %d", http_port_);
@@ -482,6 +498,84 @@ class SerialSenderNode : public rclcpp::Node {
     state.pos_contact_state_2 = 0;
 
     udp_handler_->SendResponse(client, charge_control::MSG_TYPE_EVSE_STATE_ACK, state, msg.header.seq);
+  }
+
+  // 充电模式切换处理函数
+  // mode=0: 智能充电模式 (GPIO 388)
+  // mode=1: 快速充电模式 (GPIO 379)
+  HttpResponse HandleChargeModeSwitch(const HttpRequest& req) {
+    HttpResponse resp;
+    resp.content_type = "application/json";
+
+    // 从查询字符串中解析mode参数
+    std::string query = req.query_string;
+    std::string mode_str;
+
+    // 解析 mode 参数
+    size_t mode_pos = query.find("mode=");
+    if (mode_pos != std::string::npos) {
+      size_t start = mode_pos + 5;  // "mode=" 长度为5
+      size_t end = query.find('&', start);
+      if (end == std::string::npos) {
+        end = query.length();
+      }
+      mode_str = query.substr(start, end - start);
+    }
+
+    if (mode_str.empty()) {
+      resp.status_code = 400;
+      resp.body = R"({"success": false, "error": "Missing mode parameter. Use /charge/switch?mode=0 for smart mode or mode=1 for fast mode"})";
+      return resp;
+    }
+
+    int mode = -1;
+    try {
+      mode = std::stoi(mode_str);
+    } catch (const std::exception& e) {
+      resp.status_code = 400;
+      resp.body = R"({"success": false, "error": "Invalid mode parameter. Must be 0 or 1"})";
+      return resp;
+    }
+
+    if (mode != 0 && mode != 1) {
+      resp.status_code = 400;
+      resp.body = R"({"success": false, "error": "Invalid mode value. Use 0 for smart mode or 1 for fast mode"})";
+      return resp;
+    }
+
+    // GPIO 379: 快速充电模式
+    // GPIO 388: 智能充电模式
+    const int GPIO_FAST_CHARGE = 379;
+    const int GPIO_SMART_CHARGE = 388;
+
+    bool success = false;
+    std::string mode_name;
+
+    if (mode == 0) {
+      // 智能充电模式：GPIO 388 高电平，GPIO 379 低电平
+      mode_name = "smart";
+      SetGpioLow(GPIO_FAST_CHARGE);
+      success = SetGpioHigh(GPIO_SMART_CHARGE);
+      RCLCPP_INFO(this->get_logger(), "Switched to Smart Charge Mode");
+      logger.info("HTTP: Switched to Smart Charge Mode");
+    } else {
+      // 快速充电模式：GPIO 379 高电平，GPIO 388 低电平
+      mode_name = "fast";
+      SetGpioLow(GPIO_SMART_CHARGE);
+      success = SetGpioHigh(GPIO_FAST_CHARGE);
+      RCLCPP_INFO(this->get_logger(), "Switched to Fast Charge Mode");
+      logger.info("HTTP: Switched to Fast Charge Mode");
+    }
+
+    if (success) {
+      resp.status_code = 200;
+      resp.body = R"({"success": true, "mode": ")" + mode_name + R"(", "message": "Charge mode switched successfully"})";
+    } else {
+      resp.status_code = 500;
+      resp.body = R"({"success": false, "error": "Failed to switch charge mode"})";
+    }
+
+    return resp;
   }
 
   // WiFi连接处理函数
@@ -617,7 +711,7 @@ class SerialSenderNode : public rclcpp::Node {
     if (new_value == 1) {
       // 上升沿：从低电平变为高电平
       RCLCPP_INFO(this->get_logger(), "Enable signal RISING edge detected");
-      
+
       // 发送充电命令给当前连接的狗
       SendChargeCommand(false, true);  // charge_stop=false, recharge=true
 
@@ -659,8 +753,7 @@ class SerialSenderNode : public rclcpp::Node {
       std::string command_topic = "charge/" + dog_id + "/command";
       mqtt_client_->publish(command_topic, payload, 1, false)->wait();
 
-      RCLCPP_INFO(this->get_logger(), "Sent charge command to [%s]: %s", 
-                  command_topic.c_str(), payload.c_str());
+      RCLCPP_INFO(this->get_logger(), "Sent charge command to [%s]: %s", command_topic.c_str(), payload.c_str());
     } catch (const mqtt::exception& e) {
       RCLCPP_ERROR(this->get_logger(), "Failed to send charge command: %s", e.what());
     } catch (const nlohmann::json::exception& e) {
@@ -737,7 +830,7 @@ class SerialSenderNode : public rclcpp::Node {
   int ReadGpioValue_Public(int gpio_num) { return ReadGpioValue_GPIO(gpio_num); }
 };
 
-}  // namespace charge_control
+} 
 
 int main(int argc, char** argv) {
   // 初始化日志系统

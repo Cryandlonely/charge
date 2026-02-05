@@ -79,16 +79,14 @@ NLOHMANN_JSON_SERIALIZE_ENUM(PowerSupplyStatus, {
 enum class ChargingStatus : uint8_t
 {
     UNKNOWN = 0,      // 电源状态未知
-    NOT_CHARGING = 1, // 未充电
-    CHARGING = 2,     // 正在充电
-    DISCHARGING = 3,  // 放电中
+    CHARGING = 1,     // 正在充电
+    DISCHARGING = 2,  // 放电中
     FULL = 4          // 已满电
 };
 
 // ChargingStatus 枚举的 JSON 序列化（使用字符串）
 NLOHMANN_JSON_SERIALIZE_ENUM(ChargingStatus, {
     {ChargingStatus::UNKNOWN, "Unknown"},
-    {ChargingStatus::NOT_CHARGING, "NotCharging"},
     {ChargingStatus::CHARGING, "Charging"},
     {ChargingStatus::DISCHARGING, "Discharging"},
     {ChargingStatus::FULL, "Full"}
