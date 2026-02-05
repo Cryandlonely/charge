@@ -4,6 +4,7 @@
 #include <atomic>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iomanip>
 #include <log4cpp/Category.hh>
@@ -142,6 +143,7 @@ class MqttCallback : public virtual mqtt::callback {
 
 class SerialSenderNode : public rclcpp::Node {
  private:
+  int charge_mode;
   std::string port_;
   int baud_rate_{0};
   double max_current_{0.0};
@@ -178,7 +180,7 @@ class SerialSenderNode : public rclcpp::Node {
   std::shared_ptr<UdpProtocolHandler> udp_handler_;
 
   // 默认AP设置
-  std::string default_ap_ssid_{"AP"};
+  std::string default_ap_ssid_{"ZT-CHARGE-AP"};
   std::string default_ap_password_{""};
 
  public:
@@ -188,8 +190,15 @@ class SerialSenderNode : public rclcpp::Node {
 
     OpenPort();
 
-    // 上电默认10A
-    SendStartupCommand();
+    // 根据充电模式发送启动命令
+    if(charge_mode == 0){
+      SetGpioHigh(388);
+      SetGpioLow(379);
+    }else if(charge_mode == 1){
+      SendStartupCommand();
+      SetGpioHigh(379);
+      SetGpioLow(388);
+    }
 
     // 初始化GPIO 381 用于监控使能信号
     gpio_enable_ = std::make_shared<GpioControl>(gpio_num_enable_);
@@ -206,6 +215,8 @@ class SerialSenderNode : public rclcpp::Node {
 
     // 设置充电桩待机状态
     SetGpioHigh(420);
+    SetGpioLow(389);
+    SetGpioLow(390);
 
     // 创建定时器监控 GPIO 381 电平变化
     monitor_timer_ = this->create_wall_timer(std::chrono::milliseconds(monitor_interval_ms_), std::bind(&SerialSenderNode::MonitorGpioCallback, this));
@@ -240,6 +251,9 @@ class SerialSenderNode : public rclcpp::Node {
     }
     try {
       YAML::Node config = YAML::LoadFile(config_path);
+
+      // 充电模式
+      charge_mode = config["charge"]["mode"].as<int>(0);
 
       // 串口配置
       port_ = config["serial"]["port"].as<std::string>("/dev/ttyS1");
@@ -402,9 +416,38 @@ class SerialSenderNode : public rclcpp::Node {
       std::lock_guard<std::mutex> lock(dog_id_mutex_);
       current_dog_id_ = dog_id;
     }
+    
+
+    if(status.temperature1 > 54.0 || status.temperature2 > 54.0 || status.temperature1 < 3.0 || status.temperature2 < 3.0 ){
+      SetGpioLow(382);
+      SetGpioLow(402);
+      // 过热故障
+      SetGpioHigh(390);
+      SetGpioLow(389);
+      SetGpioLow(420);
+      SetGpioLow(397);
+      SetGpioLow(387);
+      SetGpioLow(395);
+      SetGpioLow(394);
+      if(status.temperature1 >= 54.0){
+        logger.info("狗ID[%s] 电池1过热故障，温度=%.1f°C，停止充电", dog_id.c_str(), status.temperature1);
+      }
+      if(status.temperature2 >= 54.0){
+        logger.info("狗ID[%s] 电池2过热故障，温度=%.1f°C，停止充电", dog_id.c_str(), status.temperature2);
+      }
+      if(status.temperature1 <= 3.0){
+        logger.info("狗ID[%s] 电池1过冷故障，温度=%.1f°C，停止充电", dog_id.c_str(), status.temperature1);
+      }
+      if(status.temperature2 <= 3.0){
+        logger.info("狗ID[%s] 电池2过冷故障，温度=%.1f°C，停止充电", dog_id.c_str(), status.temperature2);
+      } 
+      return;
+    }
 
     if (status.charging_status == ChargingStatus::CHARGING) {
       SetGpioHigh(389);
+      SetGpioLow(390);
+      SetGpioLow(420);
       // 设置电量指示灯
       if (power < 25.0) {
         SetGpioLow(397);
@@ -438,6 +481,9 @@ class SerialSenderNode : public rclcpp::Node {
 
     // 注册充电模式切换接口
     http_server_->RegisterHandler("POST", "/charge/switch", [this](const HttpRequest& req) { return HandleChargeModeSwitch(req); });
+
+    // 注册日志查询接口
+    http_server_->RegisterHandler("GET", "/charge/loginfo", [this](const HttpRequest& req) { return HandleLogQuery(req); });
 
     if (http_server_->Start(http_port_)) {
       RCLCPP_INFO(this->get_logger(), "HTTP Server started on port %d", http_port_);
@@ -554,17 +600,19 @@ class SerialSenderNode : public rclcpp::Node {
     if (mode == 0) {
       // 智能充电模式：GPIO 388 高电平，GPIO 379 低电平
       mode_name = "smart";
+      charge_mode = 0;
       SetGpioLow(GPIO_FAST_CHARGE);
       success = SetGpioHigh(GPIO_SMART_CHARGE);
       RCLCPP_INFO(this->get_logger(), "Switched to Smart Charge Mode");
-      logger.info("HTTP: Switched to Smart Charge Mode");
+      logger.info("切换为智能充电模式");
     } else {
       // 快速充电模式：GPIO 379 高电平，GPIO 388 低电平
       mode_name = "fast";
+      charge_mode = 1;
       SetGpioLow(GPIO_SMART_CHARGE);
       success = SetGpioHigh(GPIO_FAST_CHARGE);
       RCLCPP_INFO(this->get_logger(), "Switched to Fast Charge Mode");
-      logger.info("HTTP: Switched to Fast Charge Mode");
+      logger.info("切换为快速充电模式");
     }
 
     if (success) {
@@ -575,6 +623,171 @@ class SerialSenderNode : public rclcpp::Node {
       resp.body = R"({"success": false, "error": "Failed to switch charge mode"})";
     }
 
+    return resp;
+  }
+
+  // 日志查询处理函数
+  // 参数: date - 日期(格式: YYYY/M/D 或 YYYY-MM-DD), interval - 时间间隔(分钟)
+  // 返回当前时间往前推interval分钟内的日志
+  HttpResponse HandleLogQuery(const HttpRequest& req) {
+    HttpResponse resp;
+    resp.content_type = "application/json";
+
+    // 解析查询参数
+    std::string query = req.query_string;
+    std::string date_str;
+    int interval = 30;  // 默认30分钟
+
+    // 解析 date 参数
+    size_t date_pos = query.find("date=");
+    if (date_pos != std::string::npos) {
+      size_t start = date_pos + 5;  // "date=" 长度为5
+      // 跳过可能的引号
+      if (start < query.length() && query[start] == '"') {
+        start++;
+      }
+      size_t end = query.find('&', start);
+      if (end == std::string::npos) {
+        end = query.length();
+      }
+      date_str = query.substr(start, end - start);
+      // 去除末尾的引号
+      if (!date_str.empty() && date_str.back() == '"') {
+        date_str.pop_back();
+      }
+    }
+
+    // 解析 interval 参数
+    size_t interval_pos = query.find("interval=");
+    if (interval_pos != std::string::npos) {
+      size_t start = interval_pos + 9;  // "interval=" 长度为9
+      size_t end = query.find('&', start);
+      if (end == std::string::npos) {
+        end = query.length();
+      }
+      std::string interval_str = query.substr(start, end - start);
+      try {
+        interval = std::stoi(interval_str);
+      } catch (const std::exception& e) {
+        interval = 30;
+      }
+    }
+
+    // 如果没有提供日期，使用当前日期
+    if (date_str.empty()) {
+      date_str = getCurrentDateString();
+    } else {
+      // 将 YYYY/M/D 格式转换为 YYYY-MM-DD 格式
+      std::replace(date_str.begin(), date_str.end(), '/', '-');
+      // URL解码 %2F -> /
+      size_t pos;
+      while ((pos = date_str.find("%2F")) != std::string::npos) {
+        date_str.replace(pos, 3, "-");
+      }
+      while ((pos = date_str.find("%2f")) != std::string::npos) {
+        date_str.replace(pos, 3, "-");
+      }
+    }
+
+    // 规范化日期格式: 确保月和日是两位数
+    std::istringstream date_ss(date_str);
+    char sep1, sep2;
+    int year, month, day;
+    date_ss >> year >> sep1 >> month >> sep2 >> day;
+    if (date_ss.fail()) {
+      resp.status_code = 400;
+      resp.body = R"({"success": false, "error": "Invalid date format. Use YYYY/M/D or YYYY-MM-DD"})";
+      return resp;
+    }
+    
+    std::ostringstream normalized_date;
+    normalized_date << year << "-" << std::setfill('0') << std::setw(2) << month << "-" << std::setw(2) << day;
+    date_str = normalized_date.str();
+
+    // 构建日志文件路径
+    std::string log_file = "./logs/charge_control_" + date_str + ".log";
+
+    // 检查日志文件是否存在
+    if (!std::filesystem::exists(log_file)) {
+      resp.status_code = 404;
+      resp.body = R"({"success": false, "error": "Log file not found for date: )" + date_str + R"("})";
+      return resp;
+    }
+
+    // 计算时间区间
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_now = *std::localtime(&time_t_now);
+
+    // 计算结束时间(当前时间)
+    std::ostringstream end_time_ss;
+    end_time_ss << std::put_time(&tm_now, "%Y-%m-%d %H:%M:%S");
+    std::string end_time_str = end_time_ss.str();
+
+    // 计算开始时间(当前时间 - interval分钟)
+    auto start_time = now - std::chrono::minutes(interval);
+    auto time_t_start = std::chrono::system_clock::to_time_t(start_time);
+    std::tm tm_start = *std::localtime(&time_t_start);
+
+    std::ostringstream start_time_ss;
+    start_time_ss << std::put_time(&tm_start, "%Y-%m-%d %H:%M:%S");
+    std::string start_time_str = start_time_ss.str();
+
+    // 读取日志文件并过滤时间范围内的日志
+    std::ifstream log_stream(log_file);
+    if (!log_stream.is_open()) {
+      resp.status_code = 500;
+      resp.body = R"({"success": false, "error": "Failed to open log file"})";
+      return resp;
+    }
+
+    std::vector<std::string> filtered_logs;
+    std::string line;
+    std::regex timestamp_pattern(R"((\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.\d+)");
+
+    while (std::getline(log_stream, line)) {
+      std::smatch match;
+      if (std::regex_search(line, match, timestamp_pattern)) {
+        std::string log_time = match[1].str();
+        // 比较时间字符串(因为格式相同，字符串比较即可)
+        if (log_time >= start_time_str && log_time <= end_time_str) {
+          filtered_logs.push_back(line);
+        }
+      }
+    }
+    log_stream.close();
+
+    // 构建JSON响应
+    std::ostringstream json_body;
+    json_body << R"({"success": true, "date": ")" << date_str 
+              << R"(", "start_time": ")" << start_time_str 
+              << R"(", "end_time": ")" << end_time_str 
+              << R"(", "interval_minutes": )" << interval 
+              << R"(, "log_count": )" << filtered_logs.size() 
+              << R"(, "logs": [)";
+
+    for (size_t i = 0; i < filtered_logs.size(); ++i) {
+      // 转义JSON字符串中的特殊字符
+      std::string escaped_log;
+      for (char c : filtered_logs[i]) {
+        switch (c) {
+          case '"': escaped_log += "\\\""; break;
+          case '\\': escaped_log += "\\\\"; break;
+          case '\n': escaped_log += "\\n"; break;
+          case '\r': escaped_log += "\\r"; break;
+          case '\t': escaped_log += "\\t"; break;
+          default: escaped_log += c; break;
+        }
+      }
+      json_body << "\"" << escaped_log << "\"";
+      if (i < filtered_logs.size() - 1) {
+        json_body << ", ";
+      }
+    }
+    json_body << "]}";
+
+    resp.status_code = 200;
+    resp.body = json_body.str();
     return resp;
   }
 
@@ -753,6 +966,7 @@ class SerialSenderNode : public rclcpp::Node {
       std::string command_topic = "charge/" + dog_id + "/command";
       mqtt_client_->publish(command_topic, payload, 1, false)->wait();
 
+      logger.info("发送充电命令到狗ID[%s]: %s", dog_id.c_str(), payload.c_str());
       RCLCPP_INFO(this->get_logger(), "Sent charge command to [%s]: %s", command_topic.c_str(), payload.c_str());
     } catch (const mqtt::exception& e) {
       RCLCPP_ERROR(this->get_logger(), "Failed to send charge command: %s", e.what());
